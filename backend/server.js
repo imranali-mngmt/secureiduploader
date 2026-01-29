@@ -6,8 +6,11 @@ const compression = require('compression');
 const mongoSanitize = require('express-mongo-sanitize');
 const hpp = require('hpp');
 const path = require('path');
-const fs = require('fs');
-require('dotenv').config();
+
+// Only load dotenv in development
+if (process.env.NODE_ENV !== 'production') {
+    require('dotenv').config();
+}
 
 const connectDB = require('./config/db');
 const errorHandler = require('./middleware/errorHandler');
@@ -20,26 +23,29 @@ const logger = require('./utils/logger');
 // Initialize express app
 const app = express();
 
-// Create uploads directory if it doesn't exist
-const uploadsDir = process.env.UPLOAD_PATH || './uploads';
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
-    logger.info('Uploads directory created');
-}
-
-// Connect to database
-connectDB();
+// Connect to database (only once)
+let isConnected = false;
+const connectOnce = async () => {
+    if (isConnected) return;
+    try {
+        await connectDB();
+        isConnected = true;
+    } catch (error) {
+        logger.error('Database connection failed:', error.message);
+    }
+};
+connectOnce();
 
 // Security Middleware
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc: ["'self'"],
-            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com"],
+            styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdnjs.cloudflare.com", "https://cdn.jsdelivr.net"],
             fontSrc: ["'self'", "https://fonts.gstatic.com", "https://cdnjs.cloudflare.com"],
-            scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+            scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com", "https://cdn.jsdelivr.net"],
             imgSrc: ["'self'", "data:", "blob:"],
-            connectSrc: ["'self'"]
+            connectSrc: ["'self'", "https://*.vercel.app"]
         }
     }
 }));
@@ -47,8 +53,8 @@ app.use(helmet({
 // CORS configuration
 app.use(cors({
     origin: process.env.NODE_ENV === 'production' 
-        ? process.env.FRONTEND_URL 
-        : ['http://localhost:3000', 'http://127.0.0.1:5500', 'http://localhost:5500'],
+        ? [process.env.FRONTEND_URL, /\.vercel\.app$/]
+        : ['http://localhost:3000', 'http://127.0.0.1:5500', 'http://localhost:5500', 'http://localhost:5000'],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
     allowedHeaders: ['Content-Type', 'Authorization']
@@ -79,8 +85,12 @@ app.use((req, res, next) => {
     next();
 });
 
-// Static files for frontend
-app.use(express.static(path.join(__dirname, '../frontend')));
+// Static files for frontend - check both possible locations
+const publicPath = path.join(__dirname, 'public');
+const frontendPath = path.join(__dirname, '../frontend');
+
+app.use(express.static(publicPath));
+app.use(express.static(frontendPath));
 
 // API Routes
 app.use('/api/auth', authRoutes);
@@ -91,17 +101,32 @@ app.get('/api/health', (req, res) => {
     res.status(200).json({
         success: true,
         message: 'Server is running',
+        environment: process.env.NODE_ENV,
         timestamp: new Date().toISOString(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        dbConnected: isConnected
     });
 });
 
-// Serve frontend
+// Serve frontend for non-API routes
 app.get('*', (req, res, next) => {
     if (req.originalUrl.startsWith('/api')) {
         return next(new AppError('API endpoint not found', 404));
     }
-    res.sendFile(path.join(__dirname, '../frontend/index.html'));
+    
+    // Try public folder first, then frontend folder
+    const indexPath = path.join(__dirname, 'public', 'index.html');
+    const altIndexPath = path.join(__dirname, '../frontend/index.html');
+    
+    res.sendFile(indexPath, (err) => {
+        if (err) {
+            res.sendFile(altIndexPath, (err2) => {
+                if (err2) {
+                    res.status(404).send('Frontend not found');
+                }
+            });
+        }
+    });
 });
 
 // 404 Handler for API routes
@@ -112,36 +137,31 @@ app.use('/api/*', (req, res, next) => {
 // Global Error Handler
 app.use(errorHandler);
 
-// Handle uncaught exceptions
+// Handle uncaught exceptions (don't exit in serverless)
 process.on('uncaughtException', (err) => {
-    logger.error('UNCAUGHT EXCEPTION! Shutting down...');
+    logger.error('UNCAUGHT EXCEPTION!');
     logger.error(err.name, err.message);
     logger.error(err.stack);
-    process.exit(1);
-});
-
-// Start server
-const PORT = process.env.PORT || 5000;
-const server = app.listen(PORT, () => {
-    logger.info(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
+    // Don't exit in serverless environment
+    if (process.env.NODE_ENV !== 'production') {
+        process.exit(1);
+    }
 });
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (err) => {
-    logger.error('UNHANDLED REJECTION! Shutting down...');
+    logger.error('UNHANDLED REJECTION!');
     logger.error(err.name, err.message);
     logger.error(err.stack);
-    server.close(() => {
-        process.exit(1);
-    });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    logger.info('SIGTERM received. Shutting down gracefully');
-    server.close(() => {
-        logger.info('Process terminated');
+// Start server only in development (not on Vercel)
+if (process.env.NODE_ENV !== 'production') {
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => {
+        logger.info(`Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
     });
-});
+}
 
+// Export for Vercel
 module.exports = app;
